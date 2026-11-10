@@ -1,0 +1,5 @@
+step=30000
+alive=688
+wall_s=1.1384
+steps_per_s=26352.7
+hash=8c4b019b9ea895e2

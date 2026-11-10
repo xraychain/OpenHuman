@@ -4,7 +4,26 @@
 
 [English](README.md) · [Türkçe](README.tr.md)
 
-> **Proje durumu: Fikir / geliştirme öncesi.** OpenHuman henüz çalışan bir insan simülatörü değildir. Biyolojik tahmin veya klinik kullanım yeteneği olduğu iddia edilmemektedir.
+> **Proje durumu: Deneysel sentetik doku v0.1.** OpenHuman henüz çalışan bir insan simülatörü değildir. Biyolojik tahmin veya klinik kullanım yeteneği olduğu iddia edilmemektedir.
+
+
+## Çalışan v0.1 prototip
+
+Kullanıcının sağladığı C++20 taslak artık derlenmiş ve yerel deneylerle sınanmış bir 2B sentetik doku simülasyonudur. İnsan fizyolojisiyle kalibre edilmemiştir. Aşağıdaki uzun vadeli vizyonun yalnızca ilk deneysel katmanı uygulanmıştır.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+./build/openhuman --steps 30000 --metrics baseline.csv --save tissue.ckpt
+./build/openhuman --resume tissue.ckpt --steps 1000
+python3 experiments/run_all.py build/openhuman
+python3 experiments/benchmark.py build/openhuman
+```
+
+Gereksinimler: C++20 derleyici, CMake >= 3.16 ve Python 3.9+. Python betikleri yalnızca standart kütüphaneyi kullanır. OpenMP isteğe bağlıdır (`-DOPENHUMAN_OPENMP=ON`, ayrıca OpenMP geliştirme kitaplığı gerekir). `--quick` kısa CI deneyi içindir. Sonuçlar varsayılan olarak `results/` klasörüne yazılır.
+
+Ölçülmüş sonuçlar: [araştırma bulguları](docs/RESEARCH_FINDINGS.md). Ayrıca [mimari](docs/ARCHITECTURE.md), [test kapsamı](docs/VALIDATION.md), [yol haritası](docs/ROADMAP.md) ve [API bütçe sınırı](docs/API_BUDGET.md). GitHub CI yapılandırması eklendi; uzaktaki CI henüz çalıştırılmadı. Depodaki MIT lisansı geçerlidir.
 
 ## Vizyon
 
@@ -80,7 +99,7 @@ Bu şema **öneridir**; uygulanmış bir mimari değildir. Makine öğrenmesi ba
 
 ## Yol haritası
 
-Aşağıdaki aşamaların tamamı **planlanmaktadır; henüz tamamlanmamıştır.**
+Aşağıdaki tablo uzun vadeli araştırma programıdır. 0–2 ve 6. aşamalar için ilk kafes prototipi uygulanmıştır; biyolojik doğrulama henüz yapılmamıştır.
 
 | Aşama | Araştırma hedefi | Örnek başarı ölçütü |
 | --- | --- | --- |
@@ -106,17 +125,17 @@ Gelecekteki hedeflerden biri, belirli model çözünürlüklerinde **aylar veya 
 
 ## Katkıda bulunmak
 
-OpenHuman şu anda fikir ve teknik tanımlama aşamasındadır. İlk katkılar için en değerli alanlar:
+İlk kafes prototipi kullanılabilir. Katkılar için en değerli alanlar:
 
 - Konuyla ilgili hakemli araştırmalar ve mevcut açık kaynak simülasyon altyapıları.
 - Test edilebilir model tasarımları, karşılaştırma testleri ve uygun kullanım haklarına sahip doğrulama verileri.
 - Yapılabilirlik, ölçekleme, biyolojik varsayımlar ve mimari üzerine teknik eleştiriler.
 
-İlk teknik kapsam netleştiğinde kurulum ve katkı kılavuzları eklenecektir.
+Değişiklik önermeden önce testleri çalıştırın; model ve performans iddialarına ölçüm ekleyin.
 
 ## Lisans
 
-Kaynak kod katkıları kabul edilmeden önce bir açık kaynak lisansı seçilip depoya eklenecektir. O zamana kadar bu depoyu **erken aşama proje önerisi** olarak değerlendirin; lisanslı yazılım dağıtımı olarak değil.
+Proje [MIT Lisansı](LICENSE) altında dağıtılmaktadır.
 
 ---
 

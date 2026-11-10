@@ -1,0 +1,532 @@
+Düşünüyor 4d, 28sn
+
+I can't carry out this mission as written from this conversation: I have no repository access, no code execution, no web access and no billing visibility here. So I have not inspected the repo, run any experiment, measured any benchmark, or committed anything, and I won't report results I don't have.
+
+What I can give you is the first implementation: a complete v0.1 simulation core, CLI and experiment driver. None of it has been compiled or run. Expect to fix a compile error or two, and treat the default parameters as back-of-envelope estimates.
+
+Design decisions
+Own small core, not PhysiCell or BioDynaMo, for v0.1. This keeps bitwise determinism and the checkpoint format under our control with zero dependencies. PhysiCell/BioFVM is the reference to cross-validate diffusion against later.
+Lattice tissue. A 2D grid with at most one cell per voxel, stored as structure-of-arrays (state, energy, damage). Shared rules live in Params; per-cell state lives in the arrays.
+Three diffusing fields: glucose, oxygen and waste. Diffusion is explicit, with no-flux walls, and the parameter check rejects unstable settings.
+Explicit supply boundary. The column x = 0 exchanges with a reservoir (a "vessel"). A ledger tracks supplied, consumed and produced mass so the conservation error is reported at every metrics row.
+Stateless random numbers. Each draw is a hash of (seed, step, voxel, stream). Results should not depend on thread count, and checkpoints need no generator state.
+Order-independent division. A parent proposes one empty neighbour; each empty voxel accepts one proposer.
+
+Explicitly programmed rules:
+
+Uptake: Michaelis–Menten uptake of glucose and oxygen, clamped to what the voxel holds.
+Energy: oxidative versus fermentative yield (30 vs 2 per glucose); fermentation produces waste.
+Regulation: glucose uptake rises when a cell's energy is low.
+Damage: waste above a threshold causes damage, which is repaired at a first-order rate.
+Death and clearance: a cell dies at zero energy or at damage ≥ 1; dead cells are cleared stochastically.
+Division: requires enough energy and an empty neighbour.
+
+Nothing sets tissue thickness, zonation or population size. Whether a bounded state appears is the hypothesis Experiment A tests.
+
+CMakeLists.txt
+cmake_minimum_required(VERSION 3.16)
+project(OpenHuman VERSION 0.1.0 LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+add_executable(openhuman src/main.cpp)
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(openhuman PRIVATE OpenMP::OpenMP_CXX)
+endif()
+src/openhuman.hpp
+// OpenHuman v0.1 core: synthetic lattice tissue. Arbitrary units; NOT calibrated physiology.
+#pragma once
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace oh {
+
+enum : uint8_t { EMPTY = 0, ALIVE = 1, DEAD = 2 };
+enum { GLU = 0, OXY = 1, WASTE = 2, NSPEC = 3 };
+constexpr uint32_t CKPT_VERSION = 1;
+
+// Shared rules. All fields are 8 bytes so the struct has no padding (written raw to checkpoints).
+struct Params {
+  int64_t nx = 96, ny = 48, seed_depth = 4;
+  uint64_t seed = 1;
+  double dt = 0.1;
+  double D[NSPEC] = {1.0, 2.0, 1.0};
+  double supply[NSPEC] = {5.0, 1.0, 0.0};
+  double k_exchange = 1.0;
+  double Vg = 0.02, Kg = 0.5, Vo = 0.12, Ko = 0.05, glyco_boost = 1.0;
+  double atp_ox = 30.0, atp_ferm = 2.0, o2_per_glu = 6.0, waste_per_glu = 2.0;
+  double maintenance = 0.03, E_max = 1.0, E_div = 0.8, E_div_cost = 0.2, r_div = 0.05;
+  double W_tox = 4.0, k_damage = 0.01, k_repair = 0.02, k_clear = 0.01;
+  double seed_fraction = 0.5;
+};
+
+struct Event { double t; int64_t offset; double value; };  // at time t, set a double param
+
+struct Ledger {
+  double mass0[NSPEC]{}, supplied[NSPEC]{}, consumed[NSPEC]{}, produced[NSPEC]{};
+  int64_t births = 0, starved = 0, poisoned = 0, cleared = 0;
+};
+
+inline double* dfield(Params& p, const std::string& k) {
+  const struct { const char* n; double* f; } t[] = {
+    {"dt", &p.dt}, {"D_glucose", &p.D[GLU]}, {"D_oxygen", &p.D[OXY]}, {"D_waste", &p.D[WASTE]},
+    {"supply_glucose", &p.supply[GLU]}, {"supply_oxygen", &p.supply[OXY]}, {"supply_waste", &p.supply[WASTE]},
+    {"k_exchange", &p.k_exchange}, {"Vg", &p.Vg}, {"Kg", &p.Kg}, {"Vo", &p.Vo}, {"Ko", &p.Ko},
+    {"glyco_boost", &p.glyco_boost}, {"atp_ox", &p.atp_ox}, {"atp_ferm", &p.atp_ferm},
+    {"o2_per_glu", &p.o2_per_glu}, {"waste_per_glu", &p.waste_per_glu}, {"maintenance", &p.maintenance},
+    {"E_max", &p.E_max}, {"E_div", &p.E_div}, {"E_div_cost", &p.E_div_cost}, {"r_div", &p.r_div},
+    {"W_tox", &p.W_tox}, {"k_damage", &p.k_damage}, {"k_repair", &p.k_repair}, {"k_clear", &p.k_clear},
+    {"seed_fraction", &p.seed_fraction}};
+  for (auto& e : t) if (k == e.n) return e.f;
+  return nullptr;
+}
+
+inline void set_kv(Params& p, std::vector<Event>& ev, const std::string& k, const std::string& v) {
+  if (k == "event") {  // event = <time> <param> <value>
+    std::istringstream ss(v); double t, val; std::string name;
+    if (!(ss >> t >> name >> val)) throw std::runtime_error("event needs: <time> <param> <value>");
+    double* f = dfield(p, name);
+    if (!f || name == "dt") throw std::runtime_error("event: unknown or forbidden param '" + name + "'");
+    ev.push_back({t, (int64_t)((char*)f - (char*)&p), val});
+  } else if (k == "nx") p.nx = std::stoll(v);
+  else if (k == "ny") p.ny = std::stoll(v);
+  else if (k == "seed_depth") p.seed_depth = std::stoll(v);
+  else if (k == "seed") p.seed = std::stoull(v);
+  else if (double* f = dfield(p, k)) *f = std::stod(v);
+  else throw std::runtime_error("unknown key '" + k + "'");
+}
+
+inline std::string trim(const std::string& s) {
+  auto a = s.find_first_not_of(" \t\r"), b = s.find_last_not_of(" \t\r");
+  return a == std::string::npos ? "" : s.substr(a, b - a + 1);
+}
+
+inline void load_config(const std::string& path, Params& p, std::vector<Event>& ev) {
+  std::ifstream f(path);
+  if (!f) throw std::runtime_error("cannot open config: " + path);
+  std::string line; int ln = 0;
+  while (std::getline(f, line)) {
+    ++ln;
+    auto h = line.find('#'); if (h != std::string::npos) line.erase(h);
+    if (trim(line).empty()) continue;
+    auto eq = line.find('=');
+    try {
+      if (eq == std::string::npos) throw std::runtime_error("expected key = value");
+      set_kv(p, ev, trim(line.substr(0, eq)), trim(line.substr(eq + 1)));
+    } catch (const std::exception& e) {
+      throw std::runtime_error(path + ":" + std::to_string(ln) + ": " + e.what());
+    }
+  }
+}
+
+inline void validate(const Params& p) {
+  auto req = [](bool ok, const char* m) { if (!ok) throw std::runtime_error(std::string("invalid parameters: ") + m); };
+  req(p.nx >= 2 && p.ny >= 2 && p.nx <= 100000 && p.ny <= 100000 && p.nx * p.ny <= 100000000, "grid size out of range");
+  req(p.dt > 0, "dt must be > 0");
+  for (int s = 0; s < NSPEC; ++s) {
+    req(p.D[s] >= 0 && p.D[s] * p.dt <= 0.25, "need 0 <= D*dt <= 0.25 (explicit diffusion stability, dx = 1)");
+    req(p.supply[s] >= 0, "supply must be >= 0");
+  }
+  req(p.k_exchange >= 0 && p.k_exchange * p.dt <= 1, "need 0 <= k_exchange*dt <= 1");
+  req(p.Kg > 0 && p.Ko > 0 && p.Vg >= 0 && p.Vo >= 0 && p.glyco_boost >= 0, "uptake constants out of range");
+  req(p.o2_per_glu > 0 && p.E_max > 0 && p.E_div > p.E_div_cost && p.E_div <= p.E_max && p.E_div_cost >= 0, "energy constants out of range");
+  req(p.k_damage >= 0 && p.k_repair >= 0 && p.k_repair * p.dt <= 1, "damage constants out of range");
+  req(p.r_div >= 0 && p.k_clear >= 0, "rates must be >= 0");
+  req(p.seed_depth >= 0 && p.seed_fraction >= 0 && p.seed_fraction <= 1, "seeding out of range");
+}
+
+// Counter-based RNG: value depends only on (seed, step, voxel, stream), not on execution order.
+inline uint64_t mix(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ULL; x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL; return x ^ (x >> 31);
+}
+inline uint64_t rnd(uint64_t seed, uint64_t step, uint64_t i, uint64_t stream) {
+  return mix(mix(mix(seed ^ (stream * 0xD6E8FEB86659FD93ULL)) + step) + i);
+}
+inline double u01(uint64_t h) { return (double)(h >> 11) * (1.0 / 9007199254740992.0); }
+
+struct Organism {
+  Params p; std::vector<Event> events; int64_t step = 0; Ledger led;
+  std::array<std::vector<double>, NSPEC> c;          // concentration fields
+  std::vector<uint8_t> state; std::vector<double> energy, damage;  // per-voxel cell state (SoA)
+  std::vector<double> tmp; std::vector<int64_t> proposal;          // scratch
+  std::FILE* evlog = nullptr;
+
+  int64_t n() const { return p.nx * p.ny; }
+  double mass(int s) const { double m = 0; for (double v : c[s]) m += v; return m; }
+
+  void init() {
+    validate(p);
+    const size_t N = (size_t)n();
+    for (int s = 0; s < NSPEC; ++s) c[s].assign(N, p.supply[s]);
+    state.assign(N, (uint8_t)EMPTY); energy.assign(N, 0.0); damage.assign(N, 0.0);
+    for (int64_t y = 0; y < p.ny; ++y)
+      for (int64_t x = 0; x < std::min(p.seed_depth, p.nx); ++x) {
+        int64_t i = y * p.nx + x;
+        if (u01(rnd(p.seed, 0, (uint64_t)i, 0)) < p.seed_fraction) { state[i] = ALIVE; energy[i] = 0.5 * p.E_max; }
+      }
+    for (int s = 0; s < NSPEC; ++s) led.mass0[s] = mass(s);
+    tmp.resize(N); proposal.resize(N); step = 0;
+  }
+
+  void step_once() { apply_events(); exchange(); metabolism(); fate(); diffuse(); ++step; }
+
+  void apply_events() {
+    bool changed = false;
+    for (const Event& e : events)
+      if (std::llround(e.t / p.dt) == step) { std::memcpy((char*)&p + e.offset, &e.value, 8); changed = true; }
+    if (changed) validate(p);
+  }
+
+  void exchange() {  // column x = 0 exchanges with a reservoir at the supply concentration
+    for (int s = 0; s < NSPEC; ++s)
+      for (int64_t y = 0; y < p.ny; ++y) {
+        double& v = c[s][y * p.nx];
+        double d = p.k_exchange * p.dt * (p.supply[s] - v);
+        v += d; led.supplied[s] += d;
+      }
+  }
+
+  void metabolism() {
+    const int64_t N = n(); double cg = 0, co = 0, pw = 0;
+    #pragma omp parallel for reduction(+ : cg, co, pw) schedule(static)
+    for (int64_t i = 0; i < N; ++i) {
+      if (state[i] != ALIVE) continue;
+      const double G = c[GLU][i], O = c[OXY][i];
+      const double boost = 1.0 + p.glyco_boost * (1.0 - energy[i] / p.E_max);  // low energy -> more uptake
+      const double ug = std::min(G, p.dt * p.Vg * boost * G / (p.Kg + G));
+      const double uo_cap = std::min(O, p.dt * p.Vo * O / (p.Ko + O));
+      const double g_ox = std::min(ug, uo_cap / p.o2_per_glu);   // glucose oxidised (oxygen-limited)
+      const double g_ferm = ug - g_ox;                            // remainder fermented -> waste
+      const double uo = std::min(uo_cap, g_ox * p.o2_per_glu);
+      const double w = g_ferm * p.waste_per_glu;
+      c[GLU][i] = G - ug; c[OXY][i] = O - uo; c[WASTE][i] += w;
+      cg += ug; co += uo; pw += w;
+      energy[i] = std::min(p.E_max, energy[i] + p.atp_ox * g_ox + p.atp_ferm * g_ferm - p.maintenance * p.dt);
+      damage[i] += p.dt * (p.k_damage * std::max(0.0, c[WASTE][i] - p.W_tox) - p.k_repair * damage[i]);
+    }
+    led.consumed[GLU] += cg; led.consumed[OXY] += co; led.produced[WASTE] += pw;
+  }
+
+  int neighbors(int64_t i, int64_t out[4]) const {
+    int k = 0; const int64_t x = i % p.nx, y = i / p.nx;
+    if (x > 0) out[k++] = i - 1;
+    if (x < p.nx - 1) out[k++] = i + 1;
+    if (y > 0) out[k++] = i - p.nx;
+    if (y < p.ny - 1) out[k++] = i + p.nx;
+    return k;
+  }
+
+  void log(const char* what, int64_t i) {
+    if (evlog) std::fprintf(evlog, "%lld,%s,%lld,%lld\n", (long long)step, what, (long long)(i % p.nx), (long long)(i / p.nx));
+  }
+
+  void fate() {
+    const int64_t N = n(); const uint64_t st = (uint64_t)step;
+    const double p_div = 1 - std::exp(-p.r_div * p.dt), p_clear = 1 - std::exp(-p.k_clear * p.dt);
+    for (int64_t i = 0; i < N; ++i) {  // death and clearance
+      if (state[i] == ALIVE) {
+        if (energy[i] <= 0) { state[i] = DEAD; energy[i] = 0; ++led.starved; log("death_energy", i); }
+        else if (damage[i] >= 1) { state[i] = DEAD; energy[i] = 0; ++led.poisoned; log("death_damage", i); }
+      } else if (state[i] == DEAD && u01(rnd(p.seed, st, (uint64_t)i, 1)) < p_clear) {
+        state[i] = EMPTY; damage[i] = 0; ++led.cleared; log("cleared", i);
+      }
+    }
+    int64_t nb[4];
+    for (int64_t i = 0; i < N; ++i) {  // each eligible cell proposes one empty neighbour
+      proposal[i] = -1;
+      if (state[i] != ALIVE || energy[i] < p.E_div || u01(rnd(p.seed, st, (uint64_t)i, 2)) >= p_div) continue;
+      int64_t empty[4]; int m = 0;
+      for (int k = neighbors(i, nb); k-- > 0;) if (state[nb[k]] == EMPTY) empty[m++] = nb[k];
+      if (m) proposal[i] = empty[rnd(p.seed, st, (uint64_t)i, 3) % (uint64_t)m];
+    }
+    for (int64_t v = 0; v < N; ++v) {  // each empty voxel accepts at most one proposer
+      if (state[v] != EMPTY) continue;
+      int64_t parent = -1; uint64_t best = 0;
+      for (int k = neighbors(v, nb); k-- > 0;) {
+        const int64_t q = nb[k];
+        if (proposal[q] != v) continue;
+        const uint64_t h = rnd(p.seed, st, (uint64_t)q, 4);
+        if (parent < 0 || h < best) { parent = q; best = h; }
+      }
+      if (parent < 0) continue;
+      const double e = 0.5 * (energy[parent] - p.E_div_cost);
+      energy[parent] = energy[v] = e; damage[v] = damage[parent]; state[v] = ALIVE;
+      ++led.births; log("division", v);
+    }
+  }
+
+  void diffuse() {  // explicit FTCS, flux form, no-flux walls
+    const int64_t nx = p.nx, ny = p.ny;
+    for (int s = 0; s < NSPEC; ++s) {
+      const double a = p.D[s] * p.dt;
+      if (a == 0) continue;
+      const std::vector<double>& src = c[s];
+      #pragma omp parallel for schedule(static)
+      for (int64_t y = 0; y < ny; ++y)
+        for (int64_t x = 0; x < nx; ++x) {
+          const int64_t i = y * nx + x; const double v = src[i]; double acc = 0;
+          if (x > 0) acc += src[i - 1] - v;
+          if (x < nx - 1) acc += src[i + 1] - v;
+          if (y > 0) acc += src[i - nx] - v;
+          if (y < ny - 1) acc += src[i + nx] - v;
+          tmp[i] = v + a * acc;
+        }
+      c[s].swap(tmp);
+    }
+  }
+
+  struct Metrics { int64_t alive = 0, dead = 0; double mean_E = 0, mean_damage = 0, mass[NSPEC], resid[NSPEC], min_conc = 0; };
+  Metrics metrics() const {
+    Metrics m;
+    for (int64_t i = 0; i < n(); ++i) {
+      if (state[i] == ALIVE) { ++m.alive; m.mean_E += energy[i]; m.mean_damage += damage[i]; }
+      else if (state[i] == DEAD) ++m.dead;
+    }
+    if (m.alive) { m.mean_E /= (double)m.alive; m.mean_damage /= (double)m.alive; }
+    m.min_conc = c[0][0];
+    for (int s = 0; s < NSPEC; ++s) {
+      m.mass[s] = mass(s);
+      m.resid[s] = m.mass[s] - (led.mass0[s] + led.supplied[s] - led.consumed[s] + led.produced[s]);
+      for (double v : c[s]) m.min_conc = std::min(m.min_conc, v);
+    }
+    return m;
+  }
+
+  uint64_t hash() const {  // FNV-1a over the full dynamic state
+    uint64_t h = 1469598103934665603ULL;
+    auto eat = [&h](const void* d, size_t len) {
+      auto b = (const unsigned char*)d;
+      for (size_t i = 0; i < len; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    };
+    eat(&step, sizeof step); eat(state.data(), state.size());
+    eat(energy.data(), energy.size() * 8); eat(damage.data(), damage.size() * 8);
+    for (auto& f : c) eat(f.data(), f.size() * 8);
+    return h;
+  }
+
+  void save(const std::string& path) const {
+    std::ofstream o(path, std::ios::binary);
+    if (!o) throw std::runtime_error("cannot write checkpoint: " + path);
+    auto w = [&o](const void* d, size_t len) { o.write((const char*)d, (std::streamsize)len); };
+    const uint32_t ver = CKPT_VERSION; const uint64_t psz = sizeof(Params), ne = events.size();
+    w("OHCK", 4); w(&ver, 4); w(&psz, 8); w(&p, sizeof p); w(&step, 8); w(&led, sizeof led);
+    w(&ne, 8); w(events.data(), ne * sizeof(Event));
+    for (auto& f : c) w(f.data(), f.size() * 8);
+    w(state.data(), state.size()); w(energy.data(), energy.size() * 8); w(damage.data(), damage.size() * 8);
+    o.flush();
+    if (!o) throw std::runtime_error("failed writing checkpoint: " + path);
+  }
+
+  void load(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("cannot open checkpoint: " + path);
+    auto r = [&f](void* d, size_t len) {
+      f.read((char*)d, (std::streamsize)len);
+      if (!f) throw std::runtime_error("checkpoint truncated or unreadable");
+    };
+    char magic[4]; uint32_t ver; uint64_t psz, ne;
+    r(magic, 4); r(&ver, 4); r(&psz, 8);
+    if (std::memcmp(magic, "OHCK", 4) != 0) throw std::runtime_error("not an OpenHuman checkpoint");
+    if (ver != CKPT_VERSION || psz != sizeof(Params)) throw std::runtime_error("unsupported checkpoint version or layout");
+    r(&p, sizeof p); validate(p); r(&step, 8); r(&led, sizeof led); r(&ne, 8);
+    if (ne > 1000000) throw std::runtime_error("corrupt checkpoint (event count)");
+    events.resize(ne); r(events.data(), ne * sizeof(Event));
+    for (auto& e : events)
+      if (e.offset < 0 || e.offset % 8 != 0 || e.offset + 8 > (int64_t)sizeof(Params))
+        throw std::runtime_error("corrupt checkpoint (event offset)");
+    const size_t N = (size_t)n();
+    for (auto& fl : c) { fl.resize(N); r(fl.data(), N * 8); }
+    state.resize(N); r(state.data(), N);
+    energy.resize(N); r(energy.data(), N * 8);
+    damage.resize(N); r(damage.data(), N * 8);
+    tmp.resize(N); proposal.resize(N);
+  }
+};
+
+}  // namespace oh
+src/main.cpp
+#include "openhuman.hpp"
+#include <chrono>
+#include <iostream>
+
+int main(int argc, char** argv) {
+  try {
+    oh::Organism o;
+    std::string cfg, resume, save, metrics, events, snapshot;
+    std::vector<std::string> sets; long long steps = 1000, every = 10;
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      auto val = [&]() -> std::string {
+        if (i + 1 >= argc) throw std::runtime_error("missing value for " + a);
+        return argv[++i];
+      };
+      if (a == "--config") cfg = val(); else if (a == "--resume") resume = val();
+      else if (a == "--save") save = val(); else if (a == "--metrics") metrics = val();
+      else if (a == "--events") events = val(); else if (a == "--snapshot") snapshot = val();
+      else if (a == "--set") sets.push_back(val());
+      else if (a == "--steps") steps = std::stoll(val()); else if (a == "--every") every = std::stoll(val());
+      else throw std::runtime_error("unknown argument " + a +
+        "\nusage: openhuman [--config f] [--set key=value]... [--steps N] [--every K] [--metrics f.csv]"
+        " [--events f.csv] [--snapshot f.csv] [--save f.ckpt] [--resume f.ckpt]");
+    }
+    if (steps < 0 || every < 1) throw std::runtime_error("--steps must be >= 0 and --every >= 1");
+
+    if (!resume.empty()) o.load(resume);
+    else if (!cfg.empty()) oh::load_config(cfg, o.p, o.events);
+    const auto nx = o.p.nx, ny = o.p.ny;
+    for (auto& s : sets) {
+      auto eq = s.find('=');
+      if (eq == std::string::npos) throw std::runtime_error("--set expects key=value, got " + s);
+      oh::set_kv(o.p, o.events, oh::trim(s.substr(0, eq)), oh::trim(s.substr(eq + 1)));
+    }
+    if (resume.empty()) o.init();
+    else {
+      if (o.p.nx != nx || o.p.ny != ny) throw std::runtime_error("cannot change grid size on resume");
+      oh::validate(o.p);
+    }
+
+    std::FILE* mf = nullptr;
+    if (!metrics.empty()) {
+      mf = std::fopen(metrics.c_str(), "w");
+      if (!mf) throw std::runtime_error("cannot write " + metrics);
+      std::fprintf(mf, "step,time,alive,dead,births,deaths_energy,deaths_damage,cleared,mean_energy,mean_damage,"
+                       "mass_glucose,mass_oxygen,mass_waste,resid_glucose,resid_oxygen,resid_waste,min_conc\n");
+    }
+    if (!events.empty()) {
+      o.evlog = std::fopen(events.c_str(), "w");
+      if (!o.evlog) throw std::runtime_error("cannot write " + events);
+      std::fprintf(o.evlog, "step,event,x,y\n");
+    }
+    auto row = [&] {
+      if (!mf) return;
+      const auto m = o.metrics();
+      std::fprintf(mf, "%lld,%.17g,%lld,%lld,%lld,%lld,%lld,%lld,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g,%.17g\n",
+        (long long)o.step, (double)o.step * o.p.dt, (long long)m.alive, (long long)m.dead, (long long)o.led.births,
+        (long long)o.led.starved, (long long)o.led.poisoned, (long long)o.led.cleared, m.mean_E, m.mean_damage,
+        m.mass[0], m.mass[1], m.mass[2], m.resid[0], m.resid[1], m.resid[2], m.min_conc);
+    };
+
+    const auto t0 = std::chrono::steady_clock::now();
+    row();
+    for (long long k = 0; k < steps; ++k) { o.step_once(); if (o.step % every == 0) row(); }
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+
+    if (!save.empty()) o.save(save);
+    if (!snapshot.empty()) {
+      std::FILE* sf = std::fopen(snapshot.c_str(), "w");
+      if (!sf) throw std::runtime_error("cannot write " + snapshot);
+      std::fprintf(sf, "x,y,state,energy,damage,glucose,oxygen,waste\n");
+      for (int64_t i = 0; i < o.n(); ++i)
+        std::fprintf(sf, "%lld,%lld,%d,%.9g,%.9g,%.9g,%.9g,%.9g\n", (long long)(i % o.p.nx), (long long)(i / o.p.nx),
+                     (int)o.state[i], o.energy[i], o.damage[i], o.c[0][i], o.c[1][i], o.c[2][i]);
+      std::fclose(sf);
+    }
+    if (mf) std::fclose(mf);
+    if (o.evlog) std::fclose(o.evlog);
+    std::printf("step=%lld\nalive=%lld\nwall_s=%.4f\nsteps_per_s=%.1f\nhash=%016llx\n", (long long)o.step,
+                (long long)o.metrics().alive, sec, steps > 0 && sec > 0 ? (double)steps / sec : 0.0,
+                (unsigned long long)o.hash());
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "error: " << e.what() << "\n";
+    return 1;
+  }
+}
+experiments/run_all.py
+
+Standard library only. It reports numbers and does not judge success, except for the hash equality checks in E and F.
+
+#!/usr/bin/env python3
+"""OpenHuman v0.1 experiments A-F plus sweeps. Usage: python experiments/run_all.py build/openhuman"""
+import csv, json, pathlib, statistics, subprocess, sys
+
+BIN = sys.argv[1] if len(sys.argv) > 1 else "build/openhuman"
+OUT = pathlib.Path("results"); OUT.mkdir(exist_ok=True)
+STEPS = 30000  # 3000 time units at dt = 0.1
+
+def run(name, steps=STEPS, sets=(), extra=()):
+    m = OUT / f"{name}.csv"
+    cmd = [BIN, "--steps", str(steps), "--every", "100", "--metrics", str(m)]
+    for s in sets:
+        cmd += ["--set", s]
+    out = subprocess.run(cmd + list(extra), check=True, capture_output=True, text=True).stdout
+    info = dict(line.split("=", 1) for line in out.split())
+    rows = list(csv.DictReader(open(m)))
+    alive = [int(r["alive"]) for r in rows]
+    tail = alive[len(alive) // 2:]
+    return {
+        "hash": info["hash"], "final_alive": alive[-1],
+        "tail_mean": statistics.mean(tail), "tail_min": min(tail), "tail_max": max(tail),
+        "max_abs_residual": max(abs(float(r[k])) for r in rows
+                                for k in ("resid_glucose", "resid_oxygen", "resid_waste")),
+        "min_conc": min(float(r["min_conc"]) for r in rows),
+    }
+
+R = {}
+R["A_baseline"] = run("A_baseline", extra=["--snapshot", str(OUT / "A_snapshot.csv")])
+R["B_glucose"] = {g: run(f"B_glucose_{g}", sets=[f"supply_glucose={g}"]) for g in (5, 2.5, 1, 0.5, 0.25)}
+R["C_oxygen"] = {o: run(f"C_oxygen_{o}", sets=[f"supply_oxygen={o}"]) for o in (1, 0.3, 0.1, 0.03, 0)}
+R["D_recovery"] = run("D_recovery", sets=["event=1000 supply_glucose 0.25", "event=1500 supply_glucose 5"])
+
+ck = str(OUT / "E.ckpt")
+run("E_part1", steps=STEPS // 2, extra=["--save", ck])
+e2 = run("E_part2", steps=STEPS - STEPS // 2, extra=["--resume", ck])  # separate process
+R["E_persistence"] = {"resumed_hash": e2["hash"], "uninterrupted_hash": R["A_baseline"]["hash"],
+                      "identical": e2["hash"] == R["A_baseline"]["hash"]}
+
+R["F_reproducibility"] = {
+    "same_seed_identical": run("F_repeat")["hash"] == R["A_baseline"]["hash"],
+    "tail_mean_by_seed": {s: run(f"F_seed_{s}", sets=[f"seed={s}"])["tail_mean"] for s in range(2, 7)},
+}
+R["sweep_maintenance"] = {v: run(f"S_maint_{v}", sets=[f"maintenance={v}"]) for v in (0.01, 0.02, 0.03, 0.05, 0.08)}
+R["sweep_glyco_boost"] = {v: run(f"S_boost_{v}", sets=[f"glyco_boost={v}"]) for v in (0, 1, 2)}
+
+json.dump(R, open(OUT / "summary.json", "w"), indent=2)
+print(json.dumps(R, indent=2))
+Build and run
+cmake -S . -B build && cmake --build build --config Release
+./build/openhuman --steps 30000 --metrics baseline.csv --snapshot final.csv
+python experiments/run_all.py build/openhuman
+# 1M-voxel benchmark; thread count is set with OMP_NUM_THREADS:
+./build/openhuman --set nx=1000 --set ny=1000 --steps 200 --every 200
+
+Config files use key = value lines with # comments, plus event = <time> <param> <value> for scheduled perturbations.
+
+What to check first
+Does the baseline produce anything interesting? My scaling estimate for the defaults is an oxygenated rim about 4 voxels deep, then a fermenting zone limited by waste toxicity or glucose. This is a prediction, not a result. If the tissue fills the domain or dies out, record that in RESEARCH_FINDINGS.md and then explore parameters.
+Conservation. resid_* should stay near rounding error and min_conc should stay ≥ 0.
+Experiment E. The resumed hash should equal the uninterrupted hash.
+Thread independence. The hash should be identical for OMP_NUM_THREADS=1 and 8. The ledger sums may differ in the last bits, but the state should not.
+Known weaknesses
+Compressed timescales. Explicit diffusion forces diffusion coefficients far below real values relative to cell timescales. An implicit solver, as BioFVM uses, is the fix.
+Uncalibrated units. All units are arbitrary and nothing is fitted to data.
+No cell movement or mechanics. The model is 2D and cells never move.
+Quiescent cells waste energy. They keep consuming at full rate and the excess is discarded at the energy cap.
+Checkpoints are not portable. They are raw structs, so they are tied to compiler and endianness.
+Bitwise reproducibility is per build. I expect it on the same binary, not across compilers.
+Engine notes (from memory; verify before citing)
+Engine	Reference	Reuse verdict
+PhysiCell / BioFVM	Ghaffarizadeh et al., PLoS Comput Biol 2018; Bioinformatics 2016	Closest in spirit. Use as the validation reference and adopt its implicit diffusion approach.
+BioDynaMo	Breitwieser et al., Bioinformatics 2022	Strong performance engineering, but heavy dependencies. Revisit at tissue scale.
+Vivarium	Agmon et al., Bioinformatics 2022	Good model for composing modules across scales. I can't confirm a specific "Vivarium 2.0" publication.
+OpenWorm	Szigeti et al., Front Comput Neurosci 2014; Sarma et al., Phil Trans R Soc B 2018	A lesson in how hard whole-organism integration is, even for 959 cells.
+Neural cellular automata	Mordvintsev et al., Distill 2020	Template for the learned-rule study, which would be trained on this simulator's output.
+Not done
+Not written: unit tests, GitHub Actions CI, plots, the learned-rule study, the three research documents, architecture decision records, the roadmap, validation, findings and limitations docs, and both READMEs.
+Not run: all experiments, benchmarks and profiling.
+Final report: most of its questions (what works, what failed, what emerged, hardware cost) can only be answered after the code runs.
+
+To proceed, either run this prompt in an agent environment with shell and repository access, or build the code above and paste back the compiler output and results/summary.json. With real numbers I can interpret the results, fix what breaks, and write the tests and documents against evidence.

@@ -1,0 +1,29 @@
+name: simulation
+on: [push, pull_request]
+jobs:
+  build-test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        mode: [release, sanitizers]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: cmake -S . -B build -DOPENHUMAN_SANITIZERS=${{ matrix.mode == 'sanitizers' && 'ON' || 'OFF' }} -DCMAKE_BUILD_TYPE=${{ matrix.mode == 'sanitizers' && 'Debug' || 'Release' }}
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure
+  openmp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DOPENHUMAN_OPENMP=ON
+      - run: cmake --build build --parallel 2
+      - run: OMP_NUM_THREADS=4 ctest --test-dir build --output-on-failure
+      - run: python3 experiments/run_all.py build/openhuman --quick
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smoke-experiments
+          path: results/

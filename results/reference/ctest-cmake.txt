@@ -1,0 +1,35 @@
+Start testing: Nov 10 18:57 +03
+----------------------------------------------------------
+1/2 Testing: core
+1/2 Test: core
+Command: "/Users/reiki/Documents/Codex/2026-11-10/referenced-chatgpt-conversation-this-is-an/work/OpenHuman/build-cmake/core_tests"
+Directory: /Users/reiki/Documents/Codex/2026-11-10/referenced-chatgpt-conversation-this-is-an/work/OpenHuman/build-cmake
+"core" start time: Nov 10 18:57 +03
+Output:
+----------------------------------------------------------
+All core checks passed
+<end of output>
+Test time =   0.58 sec
+----------------------------------------------------------
+Test Passed.
+"core" end time: Nov 10 18:57 +03
+"core" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/2 Testing: cli
+2/2 Test: cli
+Command: "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/bin/python3.9" "/Users/reiki/Documents/Codex/2026-11-10/referenced-chatgpt-conversation-this-is-an/work/OpenHuman/tests/cli.py" "/Users/reiki/Documents/Codex/2026-11-10/referenced-chatgpt-conversation-this-is-an/work/OpenHuman/build-cmake/openhuman"
+Directory: /Users/reiki/Documents/Codex/2026-11-10/referenced-chatgpt-conversation-this-is-an/work/OpenHuman/build-cmake
+"cli" start time: Nov 10 18:57 +03
+Output:
+----------------------------------------------------------
+CLI, process restart, corruption and thread-count checks passed
+<end of output>
+Test time =   0.73 sec
+----------------------------------------------------------
+Test Passed.
+"cli" end time: Nov 10 18:57 +03
+"cli" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Nov 10 18:57 +03

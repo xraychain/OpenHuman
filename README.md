@@ -4,7 +4,28 @@
 
 [English](README.md) · [Türkçe](README.tr.md)
 
-> **Project status: Concept / pre-development.** OpenHuman is a research vision, not a working human simulator. No biological predictions or clinical capabilities are claimed.
+> **Project status: Experimental synthetic tissue v0.1.** OpenHuman is a research vision, not a working human simulator. No biological predictions or clinical capabilities are claimed.
+
+
+## Working v0.1 prototype
+
+The supplied C++20 proposal is now a compiled, locally tested 2D synthetic tissue simulator. It is uncalibrated and uses arbitrary units. Only this first experimental substrate of the long-term vision below is implemented.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+./build/openhuman --steps 30000 --metrics baseline.csv --save tissue.ckpt
+./build/openhuman --resume tissue.ckpt --steps 1000
+python3 experiments/run_all.py build/openhuman
+python3 experiments/benchmark.py build/openhuman
+```
+
+Requires a C++20 compiler, CMake >= 3.16 and Python 3.9+. Python scripts use only the standard library. OpenMP is opt-in (`-DOPENHUMAN_OPENMP=ON`, requires its development library). `--quick` runs a short CI experiment. Generated outputs default to `results/`.
+
+CLI options: `--config file`, repeated `--set key=value`, `--steps N`, `--every K`, `--metrics file.csv`, `--events file.csv`, `--snapshot file.csv`, `--save file.ckpt`, `--resume file.ckpt`. Config lines are `key = value`, with `#` comments; scheduled perturbations use `event = 1000 supply_glucose 0.25`. Resume cannot be combined with config or overrides. Checkpoints from the original raw-memory draft are unsupported.
+
+Read the [measured findings](docs/RESEARCH_FINDINGS.md), [architecture](docs/ARCHITECTURE.md), [validation boundaries](docs/VALIDATION.md), [roadmap](docs/ROADMAP.md) and [API budget constraints](docs/API_BUDGET.md). CI has been configured but not yet run on GitHub.
 
 ## The vision
 
@@ -80,7 +101,7 @@ The diagram is a **proposal**, not an implemented architecture. Machine learning
 
 ## Roadmap
 
-All stages below are **planned**, not completed.
+The table below describes the long-term research program. Initial work on stages 0–2 and 6 is implemented for the uncalibrated lattice prototype; these milestones are not biologically validated.
 
 | Stage | Research milestone | Example success criterion |
 | --- | --- | --- |
@@ -106,17 +127,17 @@ A future goal is to test whether **months or years of simulated time can run wit
 
 ## Getting involved
 
-OpenHuman is currently at the idea and specification stage. Early contributions are most useful in the form of:
+The first lattice prototype is available. Contributions are most useful in the form of:
 
 - Relevant peer-reviewed research and existing open-source simulation frameworks.
 - Testable model designs, benchmarks, and validation datasets with appropriate usage rights.
 - Critiques of feasibility, scaling, biological assumptions, and architecture.
 
-Implementation instructions and contribution guidelines will be added when the initial technical scope is defined.
+Run the tests before proposing changes, and include measured evidence for model or performance claims.
 
 ## License
 
-An open-source license will be selected and added before source-code contributions are accepted. Until then, this repository should be treated as an **early-stage project proposal**, not as a licensed software distribution.
+Distributed under the [MIT License](LICENSE).
 
 ---
 

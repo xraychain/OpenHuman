@@ -1,0 +1,8 @@
+build*/
+results/*
+!results/reference/
+*.log
+__pycache__/
+*.ckpt
+.env
+.env.*
